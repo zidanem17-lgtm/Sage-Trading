@@ -1156,7 +1156,9 @@ export default function SageTrading() {
   const [wsStatus,   setWsStatus]   = useState("connecting"); // "connecting"|"live"|"fallback"
   const [account,    setAccount]    = useState(null);
   const [candleLoad, setCandleLoad] = useState(false);
+  const [loadKey,    setLoadKey]    = useState(0);
   const wsRef = useRef(null);
+  const wsWentLive = useRef(false);
 
   /* ---------- chart state ---------- */
   const [selected,   setSelected]   = useState("AAPL");
@@ -1230,7 +1232,7 @@ export default function SageTrading() {
     }
     load();
     return () => { cancelled = true; };
-  }, [selected, timeframe]);
+  }, [selected, timeframe, loadKey]);
 
   /* ================================================================
      WEBSOCKET STREAM  -- live price ticks from backend
@@ -1400,6 +1402,16 @@ export default function SageTrading() {
       if (acc) setAccount(acc);
     });
   }, []);
+
+  /* When WS first goes live, reload candles so real API data replaces any
+     simulated candles that were generated during the cold-start window.   */
+  useEffect(() => {
+    if (wsStatus === "live" && !wsWentLive.current) {
+      wsWentLive.current = true;
+      MarketDataService._backendCheckedAt = 0; // force fresh backend check
+      setLoadKey(k => k + 1);
+    }
+  }, [wsStatus]);
 
   /* ---------- clock ---------- */
   useEffect(() => {
