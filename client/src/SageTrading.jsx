@@ -1596,6 +1596,22 @@ export default function SageTrading() {
   useEffect(() => { zoomRef.current    = zoom;    }, [zoom]);
   useEffect(() => { panRef.current     = panOff;  }, [panOff]);
 
+  /* drawing state refs (for use inside callbacks without stale closure issues) */
+  const activeToolRef     = useRef("cursor");
+  const drawingsRef       = useRef([]);
+  const selectedDrawIdRef = useRef(null);
+  const activeDrawingRef  = useRef(null);
+  const drawColorRef      = useRef("#0de8a2");
+  const drawWidthRef      = useRef(1.5);
+  const drawDashRef       = useRef(false);
+  useEffect(() => { activeToolRef.current     = activeTool;     }, [activeTool]);
+  useEffect(() => { drawingsRef.current       = drawings;       }, [drawings]);
+  useEffect(() => { selectedDrawIdRef.current = selectedDrawId; }, [selectedDrawId]);
+  useEffect(() => { activeDrawingRef.current  = activeDrawing;  }, [activeDrawing]);
+  useEffect(() => { drawColorRef.current      = drawColor;      }, [drawColor]);
+  useEffect(() => { drawWidthRef.current      = drawWidth;      }, [drawWidth]);
+  useEffect(() => { drawDashRef.current       = drawDash;       }, [drawDash]);
+
   /* latest market refs for bot ticking */
   const stocksRef  = useRef(stocks);
   const forexRef   = useRef(forex);
@@ -1812,6 +1828,51 @@ export default function SageTrading() {
     }
   }, [wsStatus]);
 
+  /* ---------- localStorage: save drawings whenever they change ---------- */
+  useEffect(() => {
+    if (!selected || !timeframe) return;
+    const key = "sage-drawings-" + selected + "-" + timeframe;
+    try { localStorage.setItem(key, JSON.stringify(drawings)); } catch {}
+  }, [drawings, selected, timeframe]);
+
+  /* ---------- localStorage: load drawings on symbol/timeframe change ---------- */
+  useEffect(() => {
+    if (!selected || !timeframe) return;
+    const key = "sage-drawings-" + selected + "-" + timeframe;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setDrawings(parsed);
+        else setDrawings([]);
+      } else {
+        setDrawings([]);
+      }
+    } catch { setDrawings([]); }
+    setSelectedDrawId(null);
+    setActiveDrawing(null);
+    drawClicksRef.current = 0;
+  }, [selected, timeframe]);
+
+  /* ---------- keyboard: Delete removes selected drawing ---------- */
+  useEffect(() => {
+    const handler = e => {
+      if ((e.key === "Delete" || e.key === "Backspace") &&
+          selectedDrawIdRef.current &&
+          document.activeElement === document.body) {
+        setDrawings(prev => prev.filter(d => d.id !== selectedDrawIdRef.current));
+        setSelectedDrawId(null);
+      }
+      if (e.key === "Escape") {
+        setActiveDrawing(null);
+        drawClicksRef.current = 0;
+        setActiveTool("cursor");
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   /* ---------- clock ---------- */
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000);
@@ -1853,42 +1914,322 @@ export default function SageTrading() {
     if (!chartRef.current || !visibleCandles.length) return;
     if (rafId.current) cancelAnimationFrame(rafId.current);
     rafId.current = requestAnimationFrame(() =>
-      renderChart(chartRef.current, visibleCandles, chartType, hover.x, hover.y, tfMs, botSignals)
+      renderChart(chartRef.current, visibleCandles, chartType, hover.x, hover.y, tfMs, botSignals, drawings, activeDrawing, selectedDrawId)
     );
     return () => { if (rafId.current) cancelAnimationFrame(rafId.current); };
-  }, [visibleCandles, chartType, hover, renderKey, botSignals, tfMs]);
+  }, [visibleCandles, chartType, hover, renderKey, botSignals, tfMs, drawings, activeDrawing, selectedDrawId]);
+
+  /* ================================================================
+     HIT TESTING  --  returns the first drawing near (px, py), or null
+  ================================================================ */
+  function hitTestDrawings(px, py, canvas, vcList, drawList) {
+    if (!canvas || !vcList.length) return null;
+    const N = vcList.length;
+    const { PAD, PH, cW, cH, step } = chartGeom(canvas, N);
+    const { pMax, pMin } = chartScale(vcList);
+    const tx = i => PAD.l + (i + 0.5) * step;
+    const ty = p => PAD.t + (1 - (p - pMin) / (pMax - pMin)) * cH;
+    const xFromTime = t => {
+      const idx = vcList.findIndex(c => c.time >= t);
+      const i = idx < 0 ? N - 1 : idx;
+      return tx(i);
+    };
+    // Iterate in reverse so last-drawn (top) is hit first
+    for (let di = drawList.length - 1; di >= 0; di--) {
+      const d = drawList[di];
+      if (!d || !d.p1) continue;
+      const x1 = xFromTime(d.p1.time);
+      const y1 = ty(d.p1.price || 0);
+      const x2 = d.p2 ? xFromTime(d.p2.time) : x1;
+      const y2 = d.p2 ? ty(d.p2.price || 0) : y1;
+      switch (d.type) {
+        case "line":
+          if (distToSeg(px, py, x1, y1, x2, y2) < 8) return d;
+          break;
+        case "ray": {
+          const dx = x2 - x1 || 0.001, dy2 = y2 - y1;
+          const t = (cW - x1) / dx;
+          const ex = dx > 0 ? Math.min(x1 + dx * t, PAD.l + cW) : x1;
+          const ey = dx > 0 ? y1 + dy2 * t : y1;
+          if (distToSeg(px, py, x1, y1, ex, ey) < 8) return d;
+          break;
+        }
+        case "xline": {
+          const dx = x2 - x1 || 0.001, dy2 = y2 - y1;
+          const tR = (PAD.l + cW - x1) / dx;
+          const tL = (PAD.l - x1) / dx;
+          const tMn = Math.min(tL, tR), tMx = Math.max(tL, tR);
+          if (distToSeg(px, py, x1 + dx * tMn, y1 + dy2 * tMn, x1 + dx * tMx, y1 + dy2 * tMx) < 8) return d;
+          break;
+        }
+        case "hline":
+          if (Math.abs(py - ty(d.p1.price)) < 6) return d;
+          break;
+        case "vline":
+          if (Math.abs(px - xFromTime(d.p1.time)) < 6) return d;
+          break;
+        case "rect":
+        case "measure": {
+          const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
+          const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
+          if (px >= rx && px <= rx + rw && py >= ry && py <= ry + rh) return d;
+          break;
+        }
+        case "channel": {
+          if (distToSeg(px, py, x1, y1, x2, y2) < 6) return d;
+          if (d.p3) {
+            const x3 = xFromTime(d.p3.time), y3 = ty(d.p3.price || 0);
+            const dy3 = y3 - y1;
+            if (distToSeg(px, py, x1, y1 + dy3, x2, y2 + dy3) < 6) return d;
+          }
+          break;
+        }
+        case "fib": {
+          if (!d.p2) break;
+          const fibLevels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618];
+          for (const lvl of fibLevels) {
+            const fp = d.p2.price + (d.p1.price - d.p2.price) * lvl;
+            if (Math.abs(py - ty(fp)) < 6) return d;
+          }
+          break;
+        }
+        case "pitch": {
+          if (distToSeg(px, py, x1, y1, x2, y2) < 6) return d;
+          if (d.p3) {
+            const x3 = xFromTime(d.p3.time), y3 = ty(d.p3.price || 0);
+            const mx = (x2 + x3) / 2, my = (y2 + y3) / 2;
+            if (distToSeg(px, py, x1, y1, mx, my) < 6) return d;
+            if (distToSeg(px, py, x2, y2, x3, y3) < 6) return d;
+          }
+          break;
+        }
+        case "arrowup":
+        case "arrowdn":
+          if (Math.hypot(px - x1, py - y1) < 14) return d;
+          break;
+        case "text": {
+          // approximate text bbox
+          const tw = (d.label ? d.label.length * 7 : 20) + 12;
+          if (px >= x1 && px <= x1 + tw && py >= y1 - 18 && py <= y1) return d;
+          break;
+        }
+        default: break;
+      }
+    }
+    return null;
+  }
 
   /* ---------- mouse handlers ---------- */
   const onMouseDown = useCallback(e => {
     if (e.button !== 0) return;
-    dragInfo.current = { active: true, startX: e.clientX, startPan: panRef.current };
-    setIsDragging(true);
-  }, []);
+    const canvas = chartRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const vc = candlesRef.current.slice(
+      Math.max(0, candlesRef.current.length - panRef.current - zoomRef.current),
+      candlesRef.current.length - panRef.current || undefined
+    );
+    // Re-compute visible candles inline (same slice as the memoized visibleCandles)
+    const total = candlesRef.current.length;
+    const end   = Math.min(total, total - panRef.current);
+    const start = Math.max(0, end - zoomRef.current);
+    const vcList = candlesRef.current.slice(start, end);
+
+    const tool = activeToolRef.current;
+
+    /* ---- ERASER: click to delete drawing ---- */
+    if (tool === "eraser") {
+      const hit = hitTestDrawings(px, py, canvas, vcList, drawingsRef.current);
+      if (hit) {
+        setDrawings(prev => prev.filter(d => d.id !== hit.id));
+        if (selectedDrawIdRef.current === hit.id) setSelectedDrawId(null);
+      }
+      return;
+    }
+
+    /* ---- CURSOR: select / drag ---- */
+    if (tool === "cursor") {
+      const hit = hitTestDrawings(px, py, canvas, vcList, drawingsRef.current);
+      if (hit) {
+        setSelectedDrawId(hit.id);
+        if (!hit.locked) {
+          // Begin drag-move of selected drawing
+          dragDrawRef.current = {
+            active: true,
+            drawId: hit.id,
+            startPx: px, startPy: py,
+            origP1: hit.p1 ? { ...hit.p1 } : null,
+            origP2: hit.p2 ? { ...hit.p2 } : null,
+            origP3: hit.p3 ? { ...hit.p3 } : null,
+          };
+        }
+      } else {
+        setSelectedDrawId(null);
+        // Start pan
+        dragInfo.current = { active: true, startX: e.clientX, startPan: panRef.current };
+        setIsDragging(true);
+      }
+      return;
+    }
+
+    /* ---- DRAWING TOOLS ---- */
+    if (!vcList.length) return;
+    const coord = pxToCoord(px, py, canvas, vcList);
+    const clickCount = drawClicksRef.current;
+
+    /* Single-click tools: hline, vline, arrowup, arrowdn */
+    if (tool === "hline" || tool === "vline" || tool === "arrowup" || tool === "arrowdn") {
+      const newD = {
+        id: uid(), type: tool,
+        p1: coord, p2: null, p3: null,
+        color: drawColorRef.current, width: drawWidthRef.current,
+        dash: drawDashRef.current, locked: false, label: "",
+      };
+      setDrawings(prev => [...prev, newD]);
+      setActiveDrawing(null);
+      drawClicksRef.current = 0;
+      return;
+    }
+
+    /* Text tool: show floating input */
+    if (tool === "text") {
+      setTextInput({ visible: true, x: px, y: py, value: "", coord });
+      return;
+    }
+
+    /* Two-click tools: line, ray, xline, rect, fib, measure */
+    const twoClickTools = ["line", "ray", "xline", "rect", "fib", "measure"];
+    if (twoClickTools.includes(tool)) {
+      if (clickCount === 0) {
+        const newD = {
+          id: uid(), type: tool,
+          p1: coord, p2: coord, p3: null,
+          color: drawColorRef.current, width: drawWidthRef.current,
+          dash: drawDashRef.current, locked: false, label: "",
+        };
+        setActiveDrawing(newD);
+        drawClicksRef.current = 1;
+      } else {
+        // Complete drawing
+        setDrawings(prev => {
+          const cur = activeDrawingRef.current;
+          if (!cur) return prev;
+          return [...prev, { ...cur, p2: coord }];
+        });
+        setActiveDrawing(null);
+        drawClicksRef.current = 0;
+      }
+      return;
+    }
+
+    /* Three-click tools: channel, pitch */
+    const threeClickTools = ["channel", "pitch"];
+    if (threeClickTools.includes(tool)) {
+      if (clickCount === 0) {
+        const newD = {
+          id: uid(), type: tool,
+          p1: coord, p2: coord, p3: null,
+          color: drawColorRef.current, width: drawWidthRef.current,
+          dash: drawDashRef.current, locked: false, label: "",
+        };
+        setActiveDrawing(newD);
+        drawClicksRef.current = 1;
+      } else if (clickCount === 1) {
+        setActiveDrawing(prev => prev ? { ...prev, p2: coord } : null);
+        drawClicksRef.current = 2;
+      } else {
+        // Complete with p3
+        setDrawings(prev => {
+          const cur = activeDrawingRef.current;
+          if (!cur) return prev;
+          return [...prev, { ...cur, p3: coord }];
+        });
+        setActiveDrawing(null);
+        drawClicksRef.current = 0;
+      }
+      return;
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const onMouseMove = useCallback(e => {
+    const canvas = chartRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+
+    /* ---- Drawing drag (move selected drawing) ---- */
+    if (dragDrawRef.current.active) {
+      const dd = dragDrawRef.current;
+      const dpx = px - dd.startPx;
+      const dpy = py - dd.startPy;
+      const total = candlesRef.current.length;
+      const end   = Math.min(total, total - panRef.current);
+      const start = Math.max(0, end - zoomRef.current);
+      const vcList = candlesRef.current.slice(start, end);
+      if (!vcList.length) return;
+      const { PAD, cW, cH } = chartGeom(canvas, vcList.length);
+      const { pMax, pMin }  = chartScale(vcList);
+      const pxPerPrice = cH / (pMax - pMin);
+      const msPerPx    = vcList.length > 1
+        ? (vcList[vcList.length - 1].time - vcList[0].time) / cW
+        : 1;
+      const dtMs   = dpx * msPerPx;
+      const dPrice = -(dpy / pxPerPrice);
+      function shiftCoord(orig) {
+        if (!orig) return null;
+        return { time: orig.time + dtMs, price: orig.price + dPrice };
+      }
+      setDrawings(prev => prev.map(d => {
+        if (d.id !== dd.drawId) return d;
+        return { ...d, p1: shiftCoord(dd.origP1), p2: shiftCoord(dd.origP2), p3: shiftCoord(dd.origP3) };
+      }));
+      return;
+    }
+
+    /* ---- Pan (cursor mode, no drawing selected) ---- */
     if (dragInfo.current.active) {
       const dx         = e.clientX - dragInfo.current.startX;
-      const rect       = chartRef.current ? chartRef.current.getBoundingClientRect() : null;
-      if (!rect) return;
       const pxPerCandle = rect.width / zoomRef.current;
       const shift       = Math.round(-dx / pxPerCandle);
       const maxPan      = Math.max(0, candlesRef.current.length - zoomRef.current);
       setPanOff(clamp(dragInfo.current.startPan + shift, 0, maxPan));
       setHover({ x: null, y: null });
-    } else {
-      const r = chartRef.current ? chartRef.current.getBoundingClientRect() : null;
-      if (!r) return;
-      setHover({ x: e.clientX - r.left, y: e.clientY - r.top });
+      return;
     }
+
+    /* ---- Update active drawing preview ---- */
+    if (activeDrawingRef.current && drawClicksRef.current > 0) {
+      const total = candlesRef.current.length;
+      const end   = Math.min(total, total - panRef.current);
+      const start = Math.max(0, end - zoomRef.current);
+      const vcList = candlesRef.current.slice(start, end);
+      if (vcList.length) {
+        const coord = pxToCoord(px, py, canvas, vcList);
+        const clicks = drawClicksRef.current;
+        if (clicks === 1) {
+          setActiveDrawing(prev => prev ? { ...prev, p2: coord } : null);
+        } else if (clicks === 2) {
+          setActiveDrawing(prev => prev ? { ...prev, p3: coord } : null);
+        }
+      }
+    }
+
+    /* ---- Crosshair hover ---- */
+    setHover({ x: px, y: py });
   }, []);
 
   const stopDrag = useCallback(() => {
     dragInfo.current.active = false;
+    dragDrawRef.current.active = false;
     setIsDragging(false);
   }, []);
 
   const onMouseLeave = useCallback(() => {
     dragInfo.current.active = false;
+    dragDrawRef.current.active = false;
     setIsDragging(false);
     setHover({ x: null, y: null });
   }, []);
@@ -2204,6 +2545,213 @@ export default function SageTrading() {
         {/* -- Content row -- */}
         <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
+          {/* ==== DRAWING TOOLBAR ==== */}
+          {!fullscreen && (
+            <div style={{
+              width: 36, flexShrink: 0,
+              background: C.surf, borderRight: "1px solid " + C.border,
+              display: "flex", flexDirection: "column", alignItems: "center",
+              paddingTop: 6, paddingBottom: 6, gap: 1, zIndex: 15, position: "relative",
+            }}>
+              {/* Tool buttons */}
+              {[
+                { id: "cursor",  title: "Select / Move",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 2L3 13L6.5 10L8.5 14.5L10 14L8 9.5L12.5 9.5Z" fill="currentColor"/></svg> },
+                { id: "line",    title: "Trend Line",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="2" y1="13" x2="14" y2="3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><circle cx="2" cy="13" r="1.8" fill="currentColor"/><circle cx="14" cy="3" r="1.8" fill="currentColor"/></svg> },
+                { id: "ray",     title: "Ray",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="2" y1="13" x2="15" y2="3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><circle cx="2" cy="13" r="1.8" fill="currentColor"/><path d="M12 3.5L15 3L14.5 6" stroke="currentColor" strokeWidth="1.2" fill="none"/></svg> },
+                { id: "xline",   title: "Extended Line",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="0" y1="13" x2="16" y2="3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg> },
+                { id: "hline",   title: "Horizontal Line",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="1" y1="8" x2="15" y2="8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="1" y1="5" x2="1" y2="11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/><line x1="15" y1="5" x2="15" y2="11" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg> },
+                { id: "vline",   title: "Vertical Line",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="8" y1="1" x2="8" y2="15" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/><line x1="5" y1="1" x2="11" y2="1" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/><line x1="5" y1="15" x2="11" y2="15" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/></svg> },
+                { id: "rect",    title: "Rectangle",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="4" width="12" height="8" rx="1" stroke="currentColor" strokeWidth="1.7"/></svg> },
+                { id: "channel", title: "Parallel Channel",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="2" y1="12" x2="14" y2="6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/><line x1="2" y1="8" x2="14" y2="2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeDasharray="3 2"/></svg> },
+                { id: "fib",     title: "Fibonacci Retracement",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><line x1="2" y1="3" x2="14" y2="3" stroke={C.green} strokeWidth="1.3"/><line x1="2" y1="6" x2="14" y2="6" stroke={C.blue} strokeWidth="1.3"/><line x1="2" y1="8.5" x2="14" y2="8.5" stroke={C.amber} strokeWidth="1.3"/><line x1="2" y1="11" x2="14" y2="11" stroke={C.blue} strokeWidth="1.3"/><line x1="2" y1="13.5" x2="14" y2="13.5" stroke={C.red} strokeWidth="1.3"/></svg> },
+                { id: "pitch",   title: "Andrews Pitchfork",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M2 8 L8 4 L14 2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none"/><path d="M2 8 L8 10 L14 14" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none" strokeDasharray="3 2"/><line x1="2" y1="8" x2="8" y2="7" stroke="currentColor" strokeWidth="1.4" strokeDasharray="3 2"/></svg> },
+                { id: "arrowup", title: "Arrow Up (Buy marker)",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><polygon points="8,2 13,12 3,12" fill={C.green} opacity="0.9"/></svg> },
+                { id: "arrowdn", title: "Arrow Down (Sell marker)",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><polygon points="8,14 13,4 3,4" fill={C.red} opacity="0.9"/></svg> },
+                { id: "text",    title: "Text Note",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><text x="2" y="13" style={{fontFamily:"sans-serif",fontSize:"13px",fill:"currentColor",fontWeight:700}}>T</text></svg> },
+                { id: "measure", title: "Price Measure",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><rect x="2" y="4" width="12" height="8" rx="1" stroke={C.amber} strokeWidth="1.5"/><line x1="8" y1="2" x2="8" y2="14" stroke={C.amber} strokeWidth="1" strokeDasharray="2 2"/></svg> },
+                { id: "eraser",  title: "Eraser",
+                  svg: <svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M3 13L6 10L12 4L13 5L7 11L5 14Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" fill="none"/><line x1="3" y1="13" x2="13" y2="13" stroke="currentColor" strokeWidth="1.4"/></svg> },
+              ].map(({ id, title, svg }) => (
+                <button
+                  key={id}
+                  title={title}
+                  onClick={() => {
+                    setActiveTool(id);
+                    if (id !== activeTool) {
+                      setActiveDrawing(null);
+                      drawClicksRef.current = 0;
+                    }
+                  }}
+                  style={{
+                    width: 28, height: 28, borderRadius: 6, border: "none", cursor: "pointer",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    background:  activeTool === id ? C.greenDim : "transparent",
+                    color:       activeTool === id ? C.green    : C.muted,
+                    outline:     activeTool === id ? "1px solid " + C.green + "50" : "none",
+                    transition: "all .1s",
+                  }}>
+                  {svg}
+                </button>
+              ))}
+
+              {/* Separator */}
+              <div style={{ width: 22, height: 1, background: C.border, margin: "4px 0" }} />
+
+              {/* Color swatch */}
+              <div style={{ position: "relative" }}>
+                <button
+                  title="Line color"
+                  onClick={() => setShowColorPick(v => !v)}
+                  style={{
+                    width: 22, height: 22, borderRadius: 4, border: "2px solid " + C.border,
+                    background: drawColor, cursor: "pointer", flexShrink: 0,
+                  }}
+                />
+                {showColorPick && (
+                  <div style={{
+                    position: "absolute", left: 30, top: 0, zIndex: 200,
+                    background: C.surf3, border: "1px solid " + C.borderMid,
+                    borderRadius: 8, padding: "8px", boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
+                    display: "flex", flexDirection: "column", gap: 6,
+                  }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 4 }}>
+                      {["#0de8a2","#4f9dff","#ff4f6d","#f5b942","#a07cf8","#22d4e8","#ffffff","#888ea8"].map(col => (
+                        <button key={col} title={col}
+                          onClick={() => { setDrawColor(col); setShowColorPick(false); }}
+                          style={{
+                            width: 20, height: 20, borderRadius: 4, border: drawColor === col ? "2px solid #fff" : "1px solid #333",
+                            background: col, cursor: "pointer",
+                          }} />
+                      ))}
+                    </div>
+                    <input
+                      type="text"
+                      defaultValue={drawColor}
+                      placeholder="#rrggbb"
+                      onKeyDown={e => {
+                        if (e.key === "Enter") {
+                          const v = e.target.value.trim();
+                          if (/^#[0-9a-fA-F]{6}$/.test(v)) { setDrawColor(v); setShowColorPick(false); }
+                        }
+                      }}
+                      style={{
+                        width: 88, background: C.surf2, border: "1px solid " + C.border,
+                        borderRadius: 4, padding: "3px 6px",
+                        color: C.text, fontFamily: "'JetBrains Mono',monospace", fontSize: 10, outline: "none",
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {/* Line width buttons */}
+              {[1, 1.5, 2.5].map((w, wi) => (
+                <button
+                  key={w}
+                  title={"Width " + w + "px"}
+                  onClick={() => setDrawWidth(w)}
+                  style={{
+                    width: 28, height: 20, borderRadius: 4, border: "none", cursor: "pointer",
+                    background: drawWidth === w ? C.greenDim : "transparent",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    transition: "all .1s",
+                  }}>
+                  <div style={{ width: 16, height: w + 0.5, borderRadius: 1, background: drawWidth === w ? C.green : C.muted }} />
+                </button>
+              ))}
+
+              {/* Dash toggle */}
+              <button
+                title={drawDash ? "Solid line" : "Dashed line"}
+                onClick={() => setDrawDash(v => !v)}
+                style={{
+                  width: 28, height: 22, borderRadius: 4, border: "none", cursor: "pointer",
+                  background: drawDash ? C.greenDim : "transparent",
+                  color: drawDash ? C.green : C.muted,
+                  display: "flex", alignItems: "center", justifyContent: "center",
+                  transition: "all .1s",
+                }}>
+                <svg width="16" height="6" viewBox="0 0 16 6" fill="none">
+                  {drawDash
+                    ? <><line x1="1" y1="3" x2="5" y2="3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><line x1="8" y1="3" x2="12" y2="3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></>
+                    : <line x1="1" y1="3" x2="15" y2="3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                  }
+                </svg>
+              </button>
+
+              <div style={{ flex: 1 }} />
+
+              {/* Lock selected drawing */}
+              {selectedDrawId && drawings.find(d => d.id === selectedDrawId) && (
+                <button
+                  title={drawings.find(d => d.id === selectedDrawId)?.locked ? "Unlock drawing" : "Lock drawing"}
+                  onClick={() => setDrawings(prev => prev.map(d =>
+                    d.id === selectedDrawId ? { ...d, locked: !d.locked } : d
+                  ))}
+                  style={{
+                    width: 28, height: 28, borderRadius: 6, border: "none", cursor: "pointer",
+                    background: drawings.find(d => d.id === selectedDrawId)?.locked ? C.amberDim : "transparent",
+                    color: drawings.find(d => d.id === selectedDrawId)?.locked ? C.amber : C.muted,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                  {drawings.find(d => d.id === selectedDrawId)?.locked
+                    ? <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="3" y="8" width="10" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.7"/><path d="M5 8V6a3 3 0 016 0v2" stroke="currentColor" strokeWidth="1.7"/></svg>
+                    : <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><rect x="3" y="8" width="10" height="7" rx="1.5" stroke="currentColor" strokeWidth="1.7"/><path d="M5 8V6a3 3 0 016 0" stroke="currentColor" strokeWidth="1.7" strokeDasharray="3 2"/></svg>
+                  }
+                </button>
+              )}
+
+              {/* Delete selected drawing */}
+              {selectedDrawId && (
+                <button
+                  title="Delete selected drawing"
+                  onClick={() => {
+                    setDrawings(prev => prev.filter(d => d.id !== selectedDrawId));
+                    setSelectedDrawId(null);
+                  }}
+                  style={{
+                    width: 28, height: 28, borderRadius: 6, border: "none", cursor: "pointer",
+                    background: C.redDim, color: C.red,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                    <path d="M3 5h10M6 5V3.5a1 1 0 011-1h2a1 1 0 011 1V5M6.5 8v4M9.5 8v4M4 5l.8 8.2a1 1 0 001 .8h4.4a1 1 0 001-.8L12 5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+              )}
+
+              {/* Clear all drawings */}
+              {drawings.length > 0 && (
+                <button
+                  title="Clear all drawings"
+                  onClick={() => { setDrawings([]); setSelectedDrawId(null); }}
+                  style={{
+                    width: 28, height: 22, borderRadius: 5, border: "none", cursor: "pointer",
+                    background: "transparent", color: C.muted, fontSize: 7,
+                    fontFamily: "'JetBrains Mono',monospace",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    letterSpacing: "0.05em",
+                  }}>
+                  CLR
+                </button>
+              )}
+            </div>
+          )}
+
           {/* ==== CHART COLUMN ==== */}
           <div style={fullscreen ? {
             position: "fixed", inset: 0, zIndex: 9990, background: C.bg,
@@ -2357,7 +2905,14 @@ export default function SageTrading() {
               <canvas
                 ref={chartRef}
                 style={{ width: "100%", height: "100%", display: "block",
-                  cursor: isDragging ? "grabbing" : "crosshair" }}
+                  cursor: isDragging
+                    ? "grabbing"
+                    : activeTool === "cursor"
+                      ? "default"
+                      : activeTool === "eraser"
+                        ? "cell"
+                        : "crosshair"
+                }}
                 onMouseDown={onMouseDown}
                 onMouseMove={onMouseMove}
                 onMouseLeave={onMouseLeave}
@@ -2383,6 +2938,76 @@ export default function SageTrading() {
                 pointerEvents: "none", opacity: 0.7 }}>
                 {visibleCandles.length + " bars  |  scroll to zoom  |  drag to pan"}
               </div>
+              {/* Text note floating input */}
+              {textInput.visible && (
+                <div style={{
+                  position: "absolute",
+                  left: textInput.x, top: textInput.y - 28,
+                  zIndex: 50,
+                  display: "flex", gap: 4, alignItems: "center",
+                }}>
+                  <input
+                    autoFocus
+                    value={textInput.value}
+                    onChange={e => setTextInput(prev => ({ ...prev, value: e.target.value }))}
+                    onKeyDown={e => {
+                      if (e.key === "Enter" && textInput.value.trim()) {
+                        const newD = {
+                          id: uid(), type: "text",
+                          p1: textInput.coord, p2: null, p3: null,
+                          color: drawColor, width: drawWidth,
+                          dash: drawDash, locked: false,
+                          label: textInput.value.trim(),
+                        };
+                        setDrawings(prev => [...prev, newD]);
+                        setTextInput({ visible: false, x: 0, y: 0, value: "", coord: null });
+                      }
+                      if (e.key === "Escape") {
+                        setTextInput({ visible: false, x: 0, y: 0, value: "", coord: null });
+                      }
+                    }}
+                    onBlur={() => {
+                      if (textInput.value.trim()) {
+                        const newD = {
+                          id: uid(), type: "text",
+                          p1: textInput.coord, p2: null, p3: null,
+                          color: drawColor, width: drawWidth,
+                          dash: drawDash, locked: false,
+                          label: textInput.value.trim(),
+                        };
+                        setDrawings(prev => [...prev, newD]);
+                      }
+                      setTextInput({ visible: false, x: 0, y: 0, value: "", coord: null });
+                    }}
+                    placeholder="Enter note..."
+                    style={{
+                      background: C.surf3, border: "1px solid " + C.green + "80",
+                      borderRadius: 5, padding: "4px 8px",
+                      color: drawColor, fontFamily: "'DM Sans',sans-serif", fontSize: 11,
+                      outline: "none", minWidth: 120,
+                    }}
+                  />
+                  <button
+                    onMouseDown={e => { e.preventDefault();
+                      if (textInput.value.trim()) {
+                        const newD = {
+                          id: uid(), type: "text",
+                          p1: textInput.coord, p2: null, p3: null,
+                          color: drawColor, width: drawWidth,
+                          dash: drawDash, locked: false,
+                          label: textInput.value.trim(),
+                        };
+                        setDrawings(prev => [...prev, newD]);
+                      }
+                      setTextInput({ visible: false, x: 0, y: 0, value: "", coord: null });
+                    }}
+                    style={{
+                      background: C.greenDim, border: "1px solid " + C.green + "50",
+                      color: C.green, borderRadius: 4, padding: "2px 7px",
+                      fontSize: 10, cursor: "pointer", fontWeight: 700,
+                    }}>OK</button>
+                </div>
+              )}
             </div>
 
             {/* Market table (hidden in fullscreen) */}
