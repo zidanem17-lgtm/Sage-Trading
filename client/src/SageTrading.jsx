@@ -454,9 +454,59 @@ function processBot(bot, curPrice) {
 }
 
 /* ================================================================
+   DRAWING TOOLKIT  —  geometry helpers
+================================================================ */
+function chartGeom(canvas, N) {
+  const W    = canvas.clientWidth;
+  const H    = canvas.clientHeight;
+  const PAD  = { l: 8, r: 76, t: 20, b: 22 };
+  const PH   = H * 0.745;
+  const cW   = W - PAD.l - PAD.r;
+  const cH   = PH - PAD.t;
+  const step = cW / Math.max(1, N);
+  return { W, H, PAD, PH, cW, cH, step };
+}
+
+function chartScale(candles) {
+  const rawMax = Math.max(...candles.map(c => c.high));
+  const rawMin = Math.min(...candles.map(c => c.low));
+  const pad    = (rawMax - rawMin) * 0.07;
+  return { pMax: rawMax + pad, pMin: rawMin - pad };
+}
+
+function pxToCoord(px, py, canvas, visibleCandles) {
+  const N   = visibleCandles.length;
+  const { W, H, PAD, PH, cW, cH, step } = chartGeom(canvas, N);
+  const { pMax, pMin } = chartScale(visibleCandles);
+  const idx   = clamp(Math.round((px - PAD.l) / step - 0.5), 0, N - 1);
+  const price = pMin + (1 - (py - PAD.t) / cH) * (pMax - pMin);
+  const time  = visibleCandles[idx] ? visibleCandles[idx].time : 0;
+  return { time, price, idx };
+}
+
+function coordToPx(time, price, canvas, visibleCandles) {
+  const N   = visibleCandles.length;
+  const { W, H, PAD, PH, cW, cH, step } = chartGeom(canvas, N);
+  const { pMax, pMin } = chartScale(visibleCandles);
+  const idx = visibleCandles.findIndex(c => c.time >= time);
+  const i   = idx < 0 ? N - 1 : idx;
+  const x   = PAD.l + (i + 0.5) * step;
+  const y   = PAD.t + (1 - (price - pMin) / (pMax - pMin)) * cH;
+  return { x, y };
+}
+
+function distToSeg(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  if (len2 === 0) return Math.hypot(px - x1, py - y1);
+  const t = clamp(((px - x1) * dx + (py - y1) * dy) / len2, 0, 1);
+  return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
+}
+
+/* ================================================================
    CANVAS CHART RENDERER
 ================================================================ */
-function renderChart(canvas, candles, chartType, hx, hy, tfMs, botSignals) {
+function renderChart(canvas, candles, chartType, hx, hy, tfMs, botSignals, drawings, activeDrawing, selectedDrawId) {
   if (!canvas || candles.length < 2) return;
   const dpr = window.devicePixelRatio || 1;
   const W   = canvas.clientWidth;
@@ -703,6 +753,342 @@ function renderChart(canvas, candles, chartType, hx, hy, tfMs, botSignals) {
       });
     }
   }
+
+  /* ---- DRAWINGS ---- */
+  const allDrawings = [...(drawings || []), ...(activeDrawing ? [activeDrawing] : [])];
+
+  // Helper: x pixel from a time value
+  function xFromTime(t) {
+    const idx = candles.findIndex(c => c.time >= t);
+    const i   = idx < 0 ? N - 1 : idx;
+    return tx(i);
+  }
+
+  function applyStroke(d) {
+    ctx.strokeStyle = d.color || C.green;
+    ctx.lineWidth   = d.width || 1.5;
+    ctx.setLineDash(d.dash ? [6, 4] : []);
+  }
+
+  function drawGlow(id) {
+    if (id === selectedDrawId) {
+      ctx.shadowColor = "#0de8a2";
+      ctx.shadowBlur  = 10;
+    } else {
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  allDrawings.forEach(d => {
+    if (!d || !d.p1) return;
+    const isSelected = d.id === selectedDrawId;
+    ctx.save();
+    drawGlow(d.id);
+    applyStroke(d);
+
+    const x1 = xFromTime(d.p1.time);
+    const y1 = ty(d.p1.price || 0);
+    const x2 = d.p2 ? xFromTime(d.p2.time) : x1;
+    const y2 = d.p2 ? ty(d.p2.price || 0)  : y1;
+
+    /* ---- trend line ---- */
+    if (d.type === "line") {
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+
+    /* ---- ray (extends from p1 through p2 to edge of chart) ---- */
+    else if (d.type === "ray") {
+      if (x1 !== x2 || y1 !== y2) {
+        const dx = x2 - x1, dy = y2 - y1;
+        const t  = Math.max((W - PAD.r - x1) / (dx || 0.001), (PAD.l - x1) / (dx || 0.001));
+        const ex = x1 + dx * (dx > 0 ? t : 0);
+        const ey = y1 + dy * (dx > 0 ? t : 0);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(dx >= 0 ? Math.min(ex, W - PAD.r) : Math.max(ex, PAD.l), ey);
+        ctx.stroke();
+        // small dot at origin
+        ctx.fillStyle = d.color || C.green;
+        ctx.beginPath();
+        ctx.arc(x1, y1, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    /* ---- extended line (infinite both ways) ---- */
+    else if (d.type === "xline") {
+      if (x1 !== x2 || y1 !== y2) {
+        const dx = x2 - x1 || 0.001, dy = y2 - y1;
+        const tR = (W - PAD.r - x1) / dx;
+        const tL = (PAD.l - x1) / dx;
+        const tMin = Math.min(tL, tR);
+        const tMax = Math.max(tL, tR);
+        ctx.beginPath();
+        ctx.moveTo(x1 + dx * tMin, y1 + dy * tMin);
+        ctx.lineTo(x1 + dx * tMax, y1 + dy * tMax);
+        ctx.stroke();
+      }
+    }
+
+    /* ---- horizontal line ---- */
+    else if (d.type === "hline") {
+      const y = ty(d.p1.price);
+      ctx.beginPath();
+      ctx.moveTo(PAD.l, y);
+      ctx.lineTo(W - PAD.r, y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = d.color || C.green;
+      ctx.font      = "9px JetBrains Mono,monospace";
+      ctx.textAlign = "left";
+      ctx.fillText(fmtP(d.p1.price), W - PAD.r + 5, y - 3);
+    }
+
+    /* ---- vertical line ---- */
+    else if (d.type === "vline") {
+      const x = xFromTime(d.p1.time);
+      ctx.beginPath();
+      ctx.moveTo(x, PAD.t);
+      ctx.lineTo(x, PH);
+      ctx.stroke();
+    }
+
+    /* ---- rectangle ---- */
+    else if (d.type === "rect") {
+      const rx  = Math.min(x1, x2);
+      const ry  = Math.min(y1, y2);
+      const rw  = Math.abs(x2 - x1);
+      const rh  = Math.abs(y2 - y1);
+      const col = d.color || C.green;
+      ctx.fillStyle   = col + "1a";
+      ctx.strokeStyle = col;
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.strokeRect(rx, ry, rw, rh);
+    }
+
+    /* ---- parallel channel ---- */
+    else if (d.type === "channel" && d.p2) {
+      const x3 = d.p3 ? xFromTime(d.p3.time) : x1;
+      const y3 = d.p3 ? ty(d.p3.price || 0)  : y1;
+      // base line p1 → p2
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      if (d.p3) {
+        // offset = p3.price - p1.price
+        const dy3 = y3 - y1;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1 + dy3);
+        ctx.lineTo(x2, y2 + dy3);
+        ctx.stroke();
+        // fill between
+        ctx.setLineDash([]);
+        const col = d.color || C.green;
+        ctx.fillStyle = col + "0d";
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.lineTo(x2, y2 + dy3);
+        ctx.lineTo(x1, y1 + dy3);
+        ctx.closePath();
+        ctx.fill();
+        // midline dashed
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = (d.color || C.green) + "66";
+        ctx.lineWidth   = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1 + dy3 / 2);
+        ctx.lineTo(x2, y2 + dy3 / 2);
+        ctx.stroke();
+      }
+    }
+
+    /* ---- fibonacci retracement ---- */
+    else if (d.type === "fib" && d.p2) {
+      const fibLevels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618];
+      const fibColors = [C.green, C.blue, C.blue, C.amber, C.blue, C.blue, C.red, C.purple];
+      // draw connector
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+      fibLevels.forEach((lvl, li) => {
+        const fibPrice = d.p2.price + (d.p1.price - d.p2.price) * lvl;
+        const fy       = ty(fibPrice);
+        if (fy < PAD.t || fy > PH) return;
+        ctx.setLineDash([5, 3]);
+        ctx.strokeStyle = fibColors[li] || C.green;
+        ctx.lineWidth   = 0.8;
+        ctx.globalAlpha = 0.7;
+        ctx.beginPath();
+        ctx.moveTo(PAD.l, fy);
+        ctx.lineTo(W - PAD.r, fy);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.setLineDash([]);
+        ctx.fillStyle = fibColors[li] || C.green;
+        ctx.font      = "8px JetBrains Mono,monospace";
+        ctx.textAlign = "right";
+        ctx.fillText(
+          (lvl * 100).toFixed(1) + "%  " + fmtP(fibPrice),
+          W - PAD.r - 2, fy - 2
+        );
+      });
+    }
+
+    /* ---- pitchfork (Andrews) ---- */
+    else if (d.type === "pitch" && d.p2) {
+      const x3 = d.p3 ? xFromTime(d.p3.time) : x2;
+      const y3 = d.p3 ? ty(d.p3.price || 0)  : y2;
+      // midpoint of p2 and p3
+      const mx = (x2 + x3) / 2;
+      const my = (y2 + y3) / 2;
+      // median line: p1 → midpoint, extended
+      const mDx = mx - x1 || 0.001, mDy = my - y1;
+      const tR  = (W - PAD.r - x1) / mDx;
+      const meX = x1 + mDx * Math.max(tR, 0);
+      const meY = y1 + mDy * Math.max(tR, 0);
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(Math.min(meX, W - PAD.r), meY);
+      ctx.stroke();
+      if (d.p3) {
+        // upper fork through p2, parallel to median
+        const tR2  = (W - PAD.r - x2) / mDx;
+        const uf1X = x2, uf1Y = y2;
+        const uf2X = Math.min(x2 + mDx * Math.max(tR2, 0), W - PAD.r);
+        const uf2Y = y2 + mDy * Math.max(tR2, 0);
+        ctx.beginPath();
+        ctx.moveTo(uf1X, uf1Y);
+        ctx.lineTo(uf2X, uf2Y);
+        ctx.stroke();
+        // lower fork through p3, parallel to median
+        const tR3  = (W - PAD.r - x3) / mDx;
+        const lf1X = x3, lf1Y = y3;
+        const lf2X = Math.min(x3 + mDx * Math.max(tR3, 0), W - PAD.r);
+        const lf2Y = y3 + mDy * Math.max(tR3, 0);
+        ctx.beginPath();
+        ctx.moveTo(lf1X, lf1Y);
+        ctx.lineTo(lf2X, lf2Y);
+        ctx.stroke();
+        // handle bar p2 → p3
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(x2, y2);
+        ctx.lineTo(x3, y3);
+        ctx.stroke();
+      }
+    }
+
+    /* ---- arrow up ---- */
+    else if (d.type === "arrowup") {
+      const col = d.color || C.green;
+      ctx.fillStyle   = col;
+      ctx.strokeStyle = col;
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x1,     y1 - 6);
+      ctx.lineTo(x1 - 7, y1 + 6);
+      ctx.lineTo(x1 + 7, y1 + 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.font      = "bold 9px sans-serif";
+      ctx.fillStyle = "#000";
+      ctx.textAlign = "center";
+      ctx.fillText("B", x1, y1 + 4);
+    }
+
+    /* ---- arrow down ---- */
+    else if (d.type === "arrowdn") {
+      const col = d.color || C.red;
+      ctx.fillStyle   = col;
+      ctx.strokeStyle = col;
+      ctx.setLineDash([]);
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(x1,     y1 + 6);
+      ctx.lineTo(x1 - 7, y1 - 6);
+      ctx.lineTo(x1 + 7, y1 - 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.font      = "bold 9px sans-serif";
+      ctx.fillStyle = "#000";
+      ctx.textAlign = "center";
+      ctx.fillText("S", x1, y1 - 2);
+    }
+
+    /* ---- text note ---- */
+    else if (d.type === "text" && d.label) {
+      const col = d.color || C.amber;
+      ctx.font      = "11px DM Sans,sans-serif";
+      ctx.textAlign = "left";
+      const tw  = ctx.measureText(d.label).width + 12;
+      const th  = 18;
+      ctx.fillStyle   = C.surf3;
+      ctx.strokeStyle = col;
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x1, y1 - th, tw, th, 3);
+      else ctx.rect(x1, y1 - th, tw, th);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.fillText(d.label, x1 + 6, y1 - 4);
+    }
+
+    /* ---- price measure ---- */
+    else if (d.type === "measure" && d.p2) {
+      const rx  = Math.min(x1, x2);
+      const ry  = Math.min(y1, y2);
+      const rw  = Math.abs(x2 - x1);
+      const rh  = Math.abs(y2 - y1);
+      const diff = d.p2.price - d.p1.price;
+      const pct  = d.p1.price ? ((diff / d.p1.price) * 100).toFixed(2) : "0";
+      const bars = Math.abs(candles.findIndex(c => c.time >= d.p2.time) -
+                            candles.findIndex(c => c.time >= d.p1.time));
+      ctx.fillStyle   = (diff >= 0 ? C.green : C.red) + "1a";
+      ctx.strokeStyle = (diff >= 0 ? C.green : C.red) + "cc";
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([]);
+      ctx.fillRect(rx, ry, rw, rh);
+      ctx.strokeRect(rx, ry, rw, rh);
+      const label = (diff >= 0 ? "+" : "") + fmtP(diff) + "  " + (diff >= 0 ? "+" : "") + pct + "%  " + bars + "bars";
+      ctx.fillStyle = diff >= 0 ? C.green : C.red;
+      ctx.font      = "9px JetBrains Mono,monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(label, rx + rw / 2, ry + rh / 2 + 4);
+    }
+
+    ctx.restore();
+    ctx.setLineDash([]);
+    ctx.shadowBlur = 0;
+
+    /* Draw anchor dots for selected drawing or active drawing */
+    if ((isSelected || d === activeDrawing) && d.p1) {
+      [d.p1, d.p2, d.p3].forEach(pt => {
+        if (!pt) return;
+        const ax = xFromTime(pt.time);
+        const ay = ty(pt.price || 0);
+        ctx.save();
+        ctx.fillStyle   = d.color || C.green;
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth   = 1.5;
+        ctx.beginPath();
+        ctx.arc(ax, ay, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      });
+    }
+  });
 
   /* Time axis */
   for (let i = 0; i <= 5; i++) {
@@ -1171,6 +1557,19 @@ export default function SageTrading() {
   const [hover,      setHover]       = useState({ x: null, y: null });
   const [isDragging, setIsDragging]  = useState(false);
   const [fullscreen, setFullscreen]  = useState(false);
+
+  /* ---------- drawing state ---------- */
+  const [drawings,       setDrawings]       = useState([]);
+  const [activeTool,     setActiveTool]     = useState("cursor");
+  const [selectedDrawId, setSelectedDrawId] = useState(null);
+  const [activeDrawing,  setActiveDrawing]  = useState(null);
+  const [drawColor,      setDrawColor]      = useState("#0de8a2");
+  const [drawWidth,      setDrawWidth]      = useState(1.5);
+  const [drawDash,       setDrawDash]       = useState(false);
+  const [showColorPick,  setShowColorPick]  = useState(false);
+  const [textInput,      setTextInput]      = useState({ visible: false, x: 0, y: 0, value: "", coord: null });
+  const drawClicksRef    = useRef(0);        // tracks # of anchor clicks for multi-point tools
+  const dragDrawRef      = useRef({ active: false, drawId: null, startPx: null, startPy: null, origP1: null, origP2: null, origP3: null });
 
   /* ---------- ui state ---------- */
   const [navId,        setNavId]        = useState("chart");
