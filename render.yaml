@@ -1,0 +1,49 @@
+services:
+  # ── Backend: Node.js API + WebSocket ───────────────────────────────
+  - type: web
+    name: sage-trading-backend
+    env: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALPACA_DATA_URL
+        value: https://data.alpaca.markets
+      - key: ALPACA_TRADE_URL
+        value: https://paper-api.alpaca.markets
+      - key: TWELVE_DATA_URL
+        value: https://api.twelvedata.com
+      # Secret keys -- set these in the Render dashboard, never commit real values
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      # After deploying the frontend, set this to its Render URL
+      # e.g. https://sage-trading-frontend.onrender.com
+      - key: FRONTEND_ORIGIN
+        sync: false
+
+  # ── Frontend: React/Vite static site ───────────────────────────────
+  - type: web
+    name: sage-trading-frontend
+    env: static
+    rootDir: client
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      # After deploying the backend, set these to its Render URL
+      # VITE_API_BASE  -> https://sage-trading-backend.onrender.com
+      # VITE_WS_URL    -> wss://sage-trading-backend.onrender.com/api/stream
+      - key: VITE_API_BASE
+        sync: false
+      - key: VITE_WS_URL
+        sync: false
